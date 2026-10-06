@@ -321,6 +321,17 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	PendingHandshakesDryRun bool
+
+	// SecuredEnabled makes the proxy also accept secured ("dd") clients: plain
+	// obfuscated2 without the FakeTLS wrapper, authenticated with the key of
+	// any configured secret. dd and ee secrets share the key, so with this
+	// option every ee secret also admits dd clients, and connections that do
+	// not start with a TLS ClientHello are parsed as obfuscated2 before falling
+	// back to the fronting host. This weakens the TLS masquerade; enable it only
+	// if you need dd clients (for example, networks where FakeTLS is broken).
+	//
+	// This is an optional setting, disabled by default.
+	SecuredEnabled bool
 }
 
 func (p ProxyOpts) valid() error {

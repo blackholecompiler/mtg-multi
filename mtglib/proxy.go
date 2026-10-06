@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"sort"
@@ -29,6 +30,10 @@ import (
 // of suppressed ones.
 const pendingHandshakesLogInterval = 10 * time.Second
 
+// errSecuredDenied reports a secured (dd) client whose secret matched but whose
+// per-user limits deny the connection; it is fronted like a wrong secret.
+var errSecuredDenied = errors.New("connection denied by per-user limit")
+
 // secretSet is an immutable snapshot of the secrets a proxy serves. The proxy
 // keeps it behind an atomic pointer so a running handshake always reads a
 // single consistent view, and ReloadSecrets can swap the whole set in without
@@ -39,6 +44,9 @@ type secretSet struct {
 	secrets   []Secret
 	names     []string
 	hostnames []string
+	// keys[i] is secrets[i].Key as a slice, precomputed for the handshake
+	// parsers that try every configured key.
+	keys [][]byte
 	// adTags[i] is the per-secret advertising tag override for secrets[i], or
 	// nil when that secret has no override; globalAdTag applies to any secret
 	// without an override, or nil when no advertising is configured.
@@ -124,6 +132,11 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		}
 	}
 
+	keys := make([][]byte, len(secretsList))
+	for i := range secretsList {
+		keys[i] = secretsList[i].Key[:]
+	}
+
 	hostnameSet := make(map[string]struct{}, len(secretsList))
 	for _, s := range secretsList {
 		hostnameSet[s.Host] = struct{}{}
@@ -140,6 +153,7 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		secrets:     secretsList,
 		names:       names,
 		hostnames:   hostnames,
+		keys:        keys,
 		adTags:      adTags,
 		globalAdTag: global,
 		limits:      limits,
@@ -157,6 +171,7 @@ type Proxy struct {
 	pendingHandshakesPerIP      uint32
 	pendingHandshakesDryRun     bool
 	pendingHandshakesLog        *logthrottle.Throttle
+	securedEnabled              bool
 	tolerateTimeSkewness        time.Duration
 	idleTimeout                 time.Duration
 	handshakeTimeout            time.Duration
@@ -279,18 +294,23 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	p.registerConn(ctx)
 	defer p.unregisterConn(ctx)
 
-	clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
-	if err != nil {
-		ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
-		return
-	}
-	defer clientConn.Stop()
+	// FakeTLS specifics: the doppelganger wrapper and a separate obfuscated2
+	// handshake inside the unwrapped TLS stream. A secured client has already
+	// done its obfuscated2 handshake in doSecuredHandshake.
+	if !ctx.secured {
+		clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
+		if err != nil {
+			ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
+			return
+		}
+		defer clientConn.Stop()
 
-	ctx.clientConn = clientConn
+		ctx.clientConn = clientConn
 
-	if err := p.doObfuscatedHandshake(ctx); err != nil {
-		ctx.logger.InfoError("obfuscated handshake is failed", err)
-		return
+		if err := p.doObfuscatedHandshake(ctx); err != nil {
+			ctx.logger.InfoError("obfuscated handshake is failed", err)
+			return
+		}
 	}
 
 	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
@@ -599,14 +619,36 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	// cannot desync the key list, hostnames and matched index mid-handshake.
 	set := p.secrets.Load()
 
-	secretKeys := make([][]byte, len(set.secrets))
-	for i := range set.secrets {
-		secretKeys[i] = set.secrets[i].Key[:]
+	if p.securedEnabled {
+		// Classify the transport before invoking a parser. A TLS ClientHello with
+		// an invalid HMAC is an active probe and must reach the mask host byte for
+		// byte; parsing its first 64 bytes as a secured handshake would consume and
+		// corrupt the fallback stream.
+		firstBytes := [5]byte{}
+		if _, err := io.ReadFull(rewind, firstBytes[:]); err != nil {
+			ctx.logger.InfoError("cannot read initial handshake bytes", err)
+			p.doDomainFrontingForHost(ctx, rewind, set.secrets[0].Host)
+
+			return false
+		}
+
+		rewind.Rewind()
+
+		if !isFakeTLSHandshake(firstBytes) {
+			if err := p.doSecuredHandshake(ctx, rewind, set); err != nil {
+				ctx.logger.InfoError("cannot process secured handshake", err)
+				p.doDomainFrontingForHost(ctx, rewind, set.secrets[0].Host)
+
+				return false
+			}
+
+			return true
+		}
 	}
 
 	result, err := fake.ReadClientHelloMulti(
 		rewind,
-		secretKeys,
+		set.keys,
 		set.hostnames,
 		p.tolerateTimeSkewness,
 	)
@@ -659,6 +701,62 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	ctx.clientConn = tls.New(ctx.clientConn, true, false)
 
 	return true
+}
+
+// isFakeTLSHandshake reports whether the first bytes look like a TLS 1.x
+// ClientHello record (handshake type, version 3.1), which is what FakeTLS
+// clients send.
+func isFakeTLSHandshake(firstBytes [5]byte) bool {
+	return firstBytes[0] == tls.TypeHandshake &&
+		firstBytes[1] == 3 &&
+		firstBytes[2] == 1
+}
+
+// doSecuredHandshake handles a secured ("dd") client: plain obfuscated2
+// without FakeTLS. The secret is found by trying the keys of all configured
+// secrets against the handshake frame (dd and ee secrets share the key). set
+// is the snapshot the caller already loaded, so the whole handshake works with
+// one consistent view of the secrets.
+func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *secretSet) error {
+	rewind.Rewind()
+
+	idx, dcIdx, cn, replayKey, err := obfuscation.ReadHandshakeMulti(rewind, set.keys)
+	if err != nil {
+		return err
+	}
+
+	if p.antiReplayCache.SeenBefore(replayKey) {
+		p.logger.Warning("replay attack has been detected (secured)!")
+		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
+
+		return errors.New("replay attack has been detected")
+	}
+
+	name := set.names[idx]
+
+	// Per-user governance limits apply to dd clients exactly as to FakeTLS
+	// ones: a denied user (disabled, expired, over quota) is fronted like a
+	// wrong secret. The history is still recorded at this point, so the caller
+	// can replay the original bytes to the fronting host.
+	if allowed, reason := p.checkLimits(name, set.limits[idx]); !allowed {
+		ctx.logger.BindStr("secret_name", name).BindStr("deny_reason", reason.String()).
+			Info("connection denied by per-user limit; routing to fronting")
+
+		return errSecuredDenied
+	}
+
+	// Authenticated: stop recording the stream for replay.
+	rewind.Commit()
+
+	ctx.secured = true
+	ctx.dc = dcIdx
+	ctx.clientConn = cn
+	ctx.matchedSecretKey = set.secrets[idx].Key[:]
+	ctx.secretName = name
+	ctx.adTag = set.effectiveAdTag(idx)
+	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
+
+	return nil
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
@@ -808,7 +906,9 @@ func (p *Proxy) doDomainFrontingForHost(ctx *streamContext, conn *connRewind, ho
 	ctx.finishPendingHandshake()
 
 	p.eventStream.Send(p.ctx, NewEventDomainFronting(ctx.streamID))
-	conn.Rewind()
+	// No more protocol detection after this point: replay the recorded bytes
+	// once and stop recording.
+	conn.FinalRewind()
 
 	nativeDialer := p.network.NativeDialer()
 	fConn, err := nativeDialer.DialContext(ctx, "tcp", p.domainFrontingAddressForHost(host))
@@ -895,6 +995,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		pendingHandshakesPerIP:   uint32(min(opts.PendingHandshakesPerIP, math.MaxUint32)), //nolint: gosec
 		pendingHandshakesDryRun:  opts.PendingHandshakesDryRun,
 		pendingHandshakesLog:     logthrottle.New(pendingHandshakesLogInterval),
+		securedEnabled:           opts.SecuredEnabled,
 		telegram:                 tg,
 		doppelGanger: doppel.NewGanger(
 			ctx,

@@ -53,8 +53,30 @@ func (c *connRewind) Read(p []byte) (int, error) {
 	return c.active.Read(p)
 }
 
+// Rewind replays every byte read through this wrapper while continuing to
+// record new bytes pulled from the underlying connection. Recording during a
+// replay is required when a second protocol parser needs more bytes than the
+// first parser consumed.
 func (c *connRewind) Rewind() {
-	c.active = io.MultiReader(&c.buf, c.Conn)
+	recorded := bytes.Clone(c.buf.Bytes())
+	c.active = io.MultiReader(bytes.NewReader(recorded), io.TeeReader(c.Conn, &c.buf))
+}
+
+// FinalRewind replays every recorded byte exactly once and then switches to
+// the underlying connection without recording further traffic. Use it when no
+// more protocol detection attempts are possible, such as mask-host fallback.
+func (c *connRewind) FinalRewind() {
+	recorded := bytes.Clone(c.buf.Bytes())
+	c.buf.Reset()
+	c.active = io.MultiReader(bytes.NewReader(recorded), c.Conn)
+}
+
+// Commit discards replay history and switches to direct pass-through. This
+// prevents an authenticated long-lived connection from accumulating traffic
+// in the handshake replay buffer.
+func (c *connRewind) Commit() {
+	c.buf.Reset()
+	c.active = c.Conn
 }
 
 func newConnRewind(conn essentials.Conn) *connRewind {

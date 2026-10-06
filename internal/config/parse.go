@@ -92,6 +92,9 @@ type tomlConfig struct {
 		MaxConnections uint   `toml:"max-connections" json:"maxConnections,omitempty"`
 		CheckInterval  string `toml:"check-interval" json:"checkInterval,omitempty"`
 	} `toml:"throttle" json:"throttle"`
+	Secured struct {
+		Enabled bool `toml:"enabled" json:"enabled,omitempty"`
+	} `toml:"secured" json:"secured,omitempty"`
 	Stats struct {
 		StatsD struct {
 			Enabled      bool   `toml:"enabled" json:"enabled,omitempty"`

@@ -512,6 +512,17 @@ urls = [
 ]
 update-each = "24h"
 
+# Secured ("dd") clients: plain obfuscated2 without the FakeTLS wrapper,
+# authenticated with the key of any configured secret. dd and ee secrets share
+# the key, so when this is enabled every ee secret also accepts dd clients,
+# and connections that do not start with a TLS ClientHello are parsed as
+# obfuscated2 before falling back to the fronting host. This weakens the TLS
+# masquerade and widens the surface for active probes. Enable it only if you
+# need dd clients, for example in networks where FakeTLS is broken.
+[secured]
+# Disabled by default.
+enabled = false
+
 # statsd statistics integration.
 [stats.statsd]
 # enabled/disabled

@@ -102,6 +102,7 @@ type Config struct {
 		MaxConnections TypeConcurrency `json:"maxConnections"`
 		CheckInterval  TypeDuration    `json:"checkInterval"`
 	} `json:"throttle"`
+	Secured   Optional `json:"secured"`
 	Stats struct {
 		StatsD struct {
 			Optional

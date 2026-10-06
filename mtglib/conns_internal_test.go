@@ -209,6 +209,45 @@ func (suite *ConnRewindTestSuite) TestRead() {
 	suite.Equal([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, data)
 }
 
+func (suite *ConnRewindTestSuite) TestSecondRewindPreservesBytesReadDuringReplay() {
+	suite.connMock.On("Read", mock.Anything)
+	original := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	suite.connMock.readBuffer.Write(original)
+
+	firstBytes := make([]byte, 2)
+	_, err := io.ReadFull(suite.conn, firstBytes)
+	suite.NoError(err)
+
+	suite.conn.Rewind()
+
+	securedProbe := make([]byte, 6)
+	_, err = io.ReadFull(suite.conn, securedProbe)
+	suite.NoError(err)
+	suite.Equal(original[:6], securedProbe)
+
+	suite.conn.FinalRewind()
+
+	data, err := io.ReadAll(suite.conn)
+	suite.NoError(err)
+	suite.Equal(original, data)
+}
+
+func (suite *ConnRewindTestSuite) TestCommitDiscardsReplayHistory() {
+	suite.connMock.On("Read", mock.Anything)
+	suite.connMock.readBuffer.Write([]byte{1, 2, 3, 4})
+
+	firstBytes := make([]byte, 2)
+	_, err := io.ReadFull(suite.conn, firstBytes)
+	suite.NoError(err)
+
+	suite.conn.Commit()
+
+	data, err := io.ReadAll(suite.conn)
+	suite.NoError(err)
+	suite.Equal([]byte{3, 4}, data)
+	suite.Empty(suite.conn.buf.Bytes())
+}
+
 type ConnProxyProtocolTestSuite struct {
 	suite.Suite
 
