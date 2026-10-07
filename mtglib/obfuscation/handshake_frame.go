@@ -82,20 +82,7 @@ func generateHandshake(dc int) handshakeFrame {
 			panic(err)
 		}
 
-		// https://github.com/tdlib/td/blob/master/td/mtproto/TcpTransport.cpp#L157-L158.
-		if frame.data[0] == 0xef { // abridged header
-			// https://core.telegram.org/mtproto/mtproto-transports#abridged
-			continue
-		}
-
-		switch binary.LittleEndian.Uint32(frame.data[:4]) {
-		case 0x44414548, // HEAD
-			0x54534f50, // POST
-			0x20544547, // GET
-			0x4954504f, // OPTI
-			0x02010316, // ????
-			0xdddddddd, // PaddedIntermediate header
-			0xeeeeeeee: // Intermediate header
+		if IsReservedFramePrefix(frame.data[:4]) {
 			continue
 		}
 
@@ -108,4 +95,34 @@ func generateHandshake(dc int) handshakeFrame {
 
 		return frame
 	}
+}
+
+// IsReservedFramePrefix reports whether the first 4 bytes of a connection can
+// never start an obfuscated2 handshake frame. Clients regenerate the random
+// frame until it does not look like another protocol or transport (see
+// generateHandshake and tdlib's TcpTransport), so such a prefix proves that
+// the peer is not an obfuscated2 client. Shorter input is never reserved.
+func IsReservedFramePrefix(prefix []byte) bool {
+	if len(prefix) < 4 { //nolint: mnd
+		return false
+	}
+
+	// https://github.com/tdlib/td/blob/master/td/mtproto/TcpTransport.cpp#L157-L158.
+	if prefix[0] == 0xef { // abridged header
+		// https://core.telegram.org/mtproto/mtproto-transports#abridged
+		return true
+	}
+
+	switch binary.LittleEndian.Uint32(prefix[:4]) {
+	case 0x44414548, // HEAD
+		0x54534f50, // POST
+		0x20544547, // GET
+		0x4954504f, // OPTI
+		0x02010316, // TLS handshake record, version 3.1
+		0xdddddddd, // PaddedIntermediate header
+		0xeeeeeeee: // Intermediate header
+		return true
+	}
+
+	return false
 }

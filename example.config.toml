@@ -519,9 +519,31 @@ update-each = "24h"
 # obfuscated2 before falling back to the fronting host. This weakens the TLS
 # masquerade and widens the surface for active probes. Enable it only if you
 # need dd clients, for example in networks where FakeTLS is broken.
+#
+# Know the trade-offs before enabling it:
+#
+# - A dd handshake has no timestamp. A FakeTLS ClientHello is accepted only
+#   within tolerate-time-skewness, but a captured dd handshake never expires.
+#   The only replay protection is the anti-replay cache ([defense.anti-replay],
+#   a Bloom filter): it forgets everything on restart and gradually forgets
+#   old entries as it fills up, after which an old handshake can be replayed
+#   to confirm that this is an MTProto proxy.
+# - 64 bytes of random-looking data as the very first message, without any
+#   protocol framing, is a well-known DPI fingerprint of obfuscated2.
+# - A dd frame cannot be told from noise until all 64 bytes have arrived.
+#   Connections whose first bytes can never start a frame (HTTP methods, TLS
+#   records, MTProto transport tags) are fronted at once, as with this option
+#   off. Any other first message shorter than 64 bytes is held for up to
+#   frame-timeout and then sent to the fronting host byte for byte, so such a
+#   probe sees the answer that much later than from the real site.
 [secured]
 # Disabled by default.
 enabled = false
+# How long a possible dd client gets to send the rest of its 64-byte
+# handshake after the first bytes. Real clients send it in one packet, so the
+# default leaves room for a retransmission on a lossy link. Capped by the
+# handshake timeout.
+frame-timeout = "2s"
 
 # statsd statistics integration.
 [stats.statsd]

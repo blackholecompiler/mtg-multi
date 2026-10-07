@@ -1,6 +1,17 @@
 package mtglib
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/mhsanaei/mtg-multi/essentials"
+	"github.com/mhsanaei/mtg-multi/mtglib/obfuscation"
+)
 
 func TestIsFakeTLSHandshake(t *testing.T) {
 	t.Parallel()
@@ -41,5 +52,142 @@ func TestIsFakeTLSHandshake(t *testing.T) {
 				t.Fatalf("isFakeTLSHandshake() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+type mapAntiReplayCache struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (m *mapAntiReplayCache) SeenBefore(data []byte) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.seen[string(data)] {
+		return true
+	}
+
+	m.seen[string(data)] = true
+
+	return false
+}
+
+type countingEventStream struct {
+	mu      sync.Mutex
+	replays int
+}
+
+func (c *countingEventStream) Send(_ context.Context, evt Event) {
+	if _, ok := evt.(EventReplayAttack); ok {
+		c.mu.Lock()
+		c.replays++
+		c.mu.Unlock()
+	}
+}
+
+// securedTestConn returns the server side of a loopback TCP connection whose
+// client side has already sent payload.
+func securedTestConn(t *testing.T, payload []byte) essentials.Conn {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close() //nolint: errcheck
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { client.Close() }) //nolint: errcheck
+
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { server.Close() }) //nolint: errcheck
+
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	return essentials.WrapNetConn(server)
+}
+
+// recordingConn captures what is written to it, so the 64-byte frame that a
+// client would send can be taken from Obfuscator.SendHandshake.
+type recordingConn struct {
+	essentials.Conn
+
+	buf bytes.Buffer
+}
+
+func (r *recordingConn) Write(p []byte) (int, error) {
+	return r.buf.Write(p) //nolint: wrapcheck
+}
+
+// The second connection that replays a captured secured handshake is
+// rejected by the anti-replay cache, and its bytes stay available for the
+// fronting replay unchanged.
+func TestDoSecuredHandshakeReplay(t *testing.T) {
+	t.Parallel()
+
+	secret := GenerateSecret("example.com")
+	events := &countingEventStream{}
+	proxy := &Proxy{
+		ctx:                 context.Background(),
+		antiReplayCache:     &mapAntiReplayCache{seen: map[string]bool{}},
+		eventStream:         events,
+		logger:              NoopLogger{},
+		securedFrameTimeout: time.Second,
+	}
+
+	set := buildSecretSet(map[string]Secret{"main": secret}, nil, nil, nil)
+	proxy.secrets.Store(set)
+
+	rec := &recordingConn{}
+	if _, err := (obfuscation.Obfuscator{Secret: secret.Key[:]}).SendHandshake(rec, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	frame := rec.buf.Bytes()
+
+	first := newStreamContext(context.Background(), NoopLogger{}, securedTestConn(t, frame))
+	if err := proxy.doSecuredHandshake(first, newConnRewind(first.clientConn), set); err != nil {
+		t.Fatalf("the first secured handshake must succeed: %v", err)
+	}
+
+	if !first.secured || first.dc != 2 || first.secretName != "main" {
+		t.Fatalf("unexpected stream state: secured=%v dc=%d secret=%q", first.secured, first.dc, first.secretName)
+	}
+
+	second := newStreamContext(context.Background(), NoopLogger{}, securedTestConn(t, frame))
+	rewind := newConnRewind(second.clientConn)
+
+	if err := proxy.doSecuredHandshake(second, rewind, set); err == nil {
+		t.Fatal("a replayed secured handshake must be rejected")
+	}
+
+	if second.secured {
+		t.Fatal("a replayed secured handshake must not mark the stream as secured")
+	}
+
+	if events.replays != 1 {
+		t.Fatalf("want 1 replay event, got %d", events.replays)
+	}
+
+	rewind.FinalRewind()
+
+	replayed := make([]byte, len(frame))
+	if _, err := io.ReadFull(rewind, replayed); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(replayed, frame) {
+		t.Fatal("the fronting replay must carry the original handshake bytes")
 	}
 }

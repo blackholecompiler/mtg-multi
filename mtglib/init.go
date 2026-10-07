@@ -102,6 +102,15 @@ const (
 	// faketls timeout verification.
 	DefaultTolerateTimeSkewness = 3 * time.Second
 
+	// DefaultSecuredFrameTimeout is how long a connection that may be a
+	// secured ("dd") client gets to deliver its 64-byte obfuscated2 frame.
+	// A real client writes the whole frame at once, right after connecting,
+	// so it normally arrives in the same TCP segment as the first bytes; the
+	// rest of the window covers a split segment that is retransmitted on a
+	// lossy mobile link (the Linux minimum RTO is 200ms). A probe that sends
+	// less is fronted when this expires.
+	DefaultSecuredFrameTimeout = 2 * time.Second
+
 	// DefaultPreferIP is a default value for Telegram IP connectivity preference.
 	DefaultPreferIP = "prefer-ipv6"
 

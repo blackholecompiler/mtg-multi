@@ -172,6 +172,7 @@ type Proxy struct {
 	pendingHandshakesDryRun     bool
 	pendingHandshakesLog        *logthrottle.Throttle
 	securedEnabled              bool
+	securedFrameTimeout         time.Duration
 	tolerateTimeSkewness        time.Duration
 	idleTimeout                 time.Duration
 	handshakeTimeout            time.Duration
@@ -230,7 +231,9 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	ctx := newStreamContext(p.ctx, p.logger, conn)
 	defer ctx.Close()
 
-	if err := ctx.clientConn.SetDeadline(time.Now().Add(p.handshakeTimeout)); err != nil {
+	ctx.handshakeDeadline = time.Now().Add(p.handshakeTimeout)
+
+	if err := ctx.clientConn.SetDeadline(ctx.handshakeDeadline); err != nil {
 		ctx.logger.WarningError("cannot set handshake timeout", err)
 		return
 	}
@@ -635,6 +638,16 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		rewind.Rewind()
 
 		if !isFakeTLSHandshake(firstBytes) {
+			// No obfuscated2 client starts with these bytes (an HTTP request,
+			// for example): front right away, as with the option off, instead
+			// of waiting for a 64-byte frame that will never come.
+			if obfuscation.IsReservedFramePrefix(firstBytes[:4]) {
+				ctx.logger.Info("first bytes cannot start a secured handshake")
+				p.doDomainFrontingForHost(ctx, rewind, set.secrets[0].Host)
+
+				return false
+			}
+
 			if err := p.doSecuredHandshake(ctx, rewind, set); err != nil {
 				ctx.logger.InfoError("cannot process secured handshake", err)
 				p.doDomainFrontingForHost(ctx, rewind, set.secrets[0].Host)
@@ -720,7 +733,7 @@ func isFakeTLSHandshake(firstBytes [5]byte) bool {
 func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *secretSet) error {
 	rewind.Rewind()
 
-	idx, dcIdx, cn, replayKey, err := obfuscation.ReadHandshakeMulti(rewind, set.keys)
+	idx, dcIdx, cn, replayKey, err := p.readSecuredFrame(ctx, rewind, set.keys)
 	if err != nil {
 		return err
 	}
@@ -757,6 +770,38 @@ func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
 
 	return nil
+}
+
+// readSecuredFrame reads the 64-byte obfuscated2 frame of a possible secured
+// client under a short read deadline (securedFrameTimeout, capped by the
+// handshake deadline). A real client sends the frame in one go, so a peer that
+// stalls below 64 bytes is a probe and must reach the fronting host about as
+// fast as with a real site, not after the whole handshake timeout. The bytes
+// read so far stay in the rewind buffer for the fronting replay. The handshake
+// deadline is restored in every case, so neither the fronting relay nor the
+// secured session inherits the short one.
+func (p *Proxy) readSecuredFrame(
+	ctx *streamContext,
+	rewind *connRewind,
+	secretKeys [][]byte,
+) (int, int, essentials.Conn, []byte, error) {
+	deadline := time.Now().Add(p.securedFrameTimeout)
+	if !ctx.handshakeDeadline.IsZero() && ctx.handshakeDeadline.Before(deadline) {
+		deadline = ctx.handshakeDeadline
+	}
+
+	if err := ctx.clientConn.SetReadDeadline(deadline); err != nil {
+		return -1, 0, nil, nil, fmt.Errorf("cannot set secured frame deadline: %w", err)
+	}
+
+	defer ctx.clientConn.SetReadDeadline(ctx.handshakeDeadline) //nolint: errcheck
+
+	idx, dcIdx, cn, replayKey, err := obfuscation.ReadHandshakeMulti(rewind, secretKeys)
+	if err != nil {
+		return -1, 0, nil, nil, fmt.Errorf("cannot read secured handshake: %w", err)
+	}
+
+	return idx, dcIdx, cn, replayKey, nil
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
@@ -996,6 +1041,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		pendingHandshakesDryRun:  opts.PendingHandshakesDryRun,
 		pendingHandshakesLog:     logthrottle.New(pendingHandshakesLogInterval),
 		securedEnabled:           opts.SecuredEnabled,
+		securedFrameTimeout:      opts.getSecuredFrameTimeout(),
 		telegram:                 tg,
 		doppelGanger: doppel.NewGanger(
 			ctx,

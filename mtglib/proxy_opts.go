@@ -330,8 +330,33 @@ type ProxyOpts struct {
 	// back to the fronting host. This weakens the TLS masquerade; enable it only
 	// if you need dd clients (for example, networks where FakeTLS is broken).
 	//
+	// Security trade-offs of a dd handshake compared with FakeTLS:
+	//
+	//   - It carries no timestamp. A FakeTLS ClientHello is only accepted
+	//     within TolerateTimeSkewness, but a captured dd handshake stays valid
+	//     forever. The only replay protection is the anti-replay cache (a
+	//     Bloom filter), which forgets everything on restart and gradually
+	//     forgets old entries as it fills up, so an old handshake can be
+	//     replayed after that to confirm that this is an MTProto proxy.
+	//   - 64 bytes of high-entropy data as the very first message, with no
+	//     protocol framing, is a well-known DPI fingerprint of obfuscated2.
+	//   - A frame cannot be told from random noise until all 64 bytes arrive.
+	//     A connection whose first 4 bytes can never start a frame (HTTP
+	//     methods, TLS records, MTProto transport tags) is fronted at once, like
+	//     with the option off. Anything else shorter than 64 bytes is held for
+	//     up to SecuredFrameTimeout and then fronted byte for byte, so such a
+	//     probe sees the fronting host answer that much later than it would
+	//     from the real site.
+	//
 	// This is an optional setting, disabled by default.
 	SecuredEnabled bool
+
+	// SecuredFrameTimeout is how long a possible secured client gets to send
+	// the rest of its 64-byte handshake frame once the first bytes have
+	// arrived. It is capped by HandshakeTimeout. Used only with SecuredEnabled.
+	//
+	// This is an optional setting, DefaultSecuredFrameTimeout by default.
+	SecuredFrameTimeout time.Duration
 }
 
 func (p ProxyOpts) valid() error {
@@ -416,6 +441,14 @@ func (p ProxyOpts) getHandshakeTimeout() time.Duration {
 	}
 
 	return p.HandshakeTimeout
+}
+
+func (p ProxyOpts) getSecuredFrameTimeout() time.Duration {
+	if p.SecuredFrameTimeout == 0 {
+		return DefaultSecuredFrameTimeout
+	}
+
+	return p.SecuredFrameTimeout
 }
 
 func (p ProxyOpts) getIdleTimeout() time.Duration {

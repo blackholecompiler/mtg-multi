@@ -24,7 +24,11 @@ type streamContext struct {
 	// FakeTLS. Its obfuscated2 handshake is done in doSecuredHandshake, so
 	// ServeConn skips the FakeTLS-specific steps.
 	secured bool
-	logger           Logger
+	logger  Logger
+
+	// handshakeDeadline is when the whole handshake must be done. Steps that
+	// use a shorter read deadline restore this one afterwards.
+	handshakeDeadline time.Time
 
 	// releasePendingHandshake frees the per-IP pending-handshake slot, if any.
 	releasePendingHandshake func()
