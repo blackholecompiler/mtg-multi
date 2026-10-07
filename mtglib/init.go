@@ -71,6 +71,10 @@ var (
 	// ErrLastSecret is returned by DeleteSecret when removing the named secret
 	// would leave the proxy with no secrets at all.
 	ErrLastSecret = errors.New("cannot delete the last secret")
+
+	// ErrDCPoolInvalid is returned if the warm DC pool settings are out of
+	// range: too many connections per DC, a zero DC id or a duplicate DC.
+	ErrDCPoolInvalid = errors.New("dc pool settings are invalid")
 )
 
 const (
@@ -152,10 +156,29 @@ const (
 	// (and evicts aged connections). Must be < DCPoolConnMaxAge so aged
 	// connections are replaced proactively.
 	DCPoolRefreshInterval = 7 * time.Second
+
+	// DCPoolMaxSize is the upper bound of warm connections kept per DC. Every
+	// pooled connection is an idle TCP connection to Telegram held open even
+	// without clients, so a typo like size = 1000 must not open thousands.
+	DCPoolMaxSize = 64
+
+	// DCPoolMaxDCs is the upper bound of DCs the pool may warm.
+	DCPoolMaxDCs = 32
+
+	// DCPoolDialTimeout bounds a single warm dial and handshake of a filler, so
+	// Shutdown never waits longer than this on an in-flight dial even if the
+	// network dialer has no timeout of its own.
+	DCPoolDialTimeout = 10 * time.Second
+
+	// DCPoolMaxBackoff caps the pause of a filler whose DC keeps failing. The
+	// pause starts at 2*DCPoolRefreshInterval and doubles on every failure in a
+	// row.
+	DCPoolMaxBackoff = 2 * time.Minute
 )
 
-// dcPoolWarmDCs is the list of Telegram DCs the warm pool keeps connections to.
-var dcPoolWarmDCs = []int{1, 2, 3, 4, 5}
+// DefaultDCPoolDCs is the default set of Telegram DCs the warm pool keeps
+// connections to: the regular (non-media) production DCs.
+var DefaultDCPoolDCs = []int{1, 2, 3, 4, 5}
 
 // Network defines a knowledge how to work with a network. It may sound fun but
 // it encapsulates all the knowledge how to properly establish connections to

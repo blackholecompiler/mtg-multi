@@ -394,6 +394,7 @@ func runProxy(conf *config.Config, version, configPath string, reloadSignals <-c
 
 		DCPoolEnabled: conf.DCPool.Enabled.Get(false),
 		DCPoolSize:    conf.DCPool.Size.Get(0),
+		DCPoolDCs:     conf.DCPool.DCs,
 	}
 
 	proxy, err := mtglib.NewProxy(opts)

@@ -3,6 +3,7 @@ package mtglib
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -89,15 +90,28 @@ func probeAlive(conn essentials.Conn) bool {
 // replaces those older than maxAge (well before the DC would close an idle
 // connection). A pool miss falls back to a cold dial, so the behaviour is
 // never worse than without the pool.
+//
+// The pool is refilled on the filler tick (interval), not right after a
+// hand-out. Under steady load only about perDC connections per DC per
+// interval are served warm, the rest dial cold: the pool targets bursts and
+// route flaps, not every connection.
+//
+// Only DCs from the configured set are pooled. get for any other DC returns
+// ok=false right away and reports nothing: the DC id comes from the client,
+// so reporting it would let anyone with a valid secret create unbounded
+// metric series.
 type dcPool struct {
-	dial     dcDialFunc
-	logger   Logger
-	observe  dcPoolObserver
-	alive    func(essentials.Conn) bool
-	dcs      []int
-	perDC    int
-	maxAge   time.Duration
-	interval time.Duration
+	dial        dcDialFunc
+	logger      Logger
+	observe     dcPoolObserver
+	alive       func(essentials.Conn) bool
+	dcs         []int
+	warm        map[int]struct{}
+	perDC       int
+	maxAge      time.Duration
+	interval    time.Duration
+	dialTimeout time.Duration
+	maxBackoff  time.Duration
 
 	mu    sync.Mutex
 	ready map[int][]warmConn
@@ -114,16 +128,23 @@ func newDCPool(ctx context.Context, dial dcDialFunc, logger Logger, observe dcPo
 	ctx, cancel := context.WithCancel(ctx)
 
 	p := &dcPool{
-		dial:     dial,
-		logger:   logger,
-		observe:  observe,
-		alive:    probeAlive,
-		dcs:      dcs,
-		perDC:    perDC,
-		maxAge:   maxAge,
-		interval: interval,
-		ready:    make(map[int][]warmConn, len(dcs)),
-		cancel:   cancel,
+		dial:        dial,
+		logger:      logger,
+		observe:     observe,
+		alive:       probeAlive,
+		dcs:         dcs,
+		warm:        make(map[int]struct{}, len(dcs)),
+		perDC:       perDC,
+		maxAge:      maxAge,
+		interval:    interval,
+		dialTimeout: DCPoolDialTimeout,
+		maxBackoff:  DCPoolMaxBackoff,
+		ready:       make(map[int][]warmConn, len(dcs)),
+		cancel:      cancel,
+	}
+
+	for _, dcID := range dcs {
+		p.warm[dcID] = struct{}{}
 	}
 
 	for _, dcID := range dcs {
@@ -140,7 +161,14 @@ func newDCPool(ctx context.Context, dial dcDialFunc, logger Logger, observe dcPo
 // skipped. ok=false means the pool had nothing usable and the caller should
 // dial cold. The liveness probe runs without holding the mutex: it may wait
 // up to dcPoolLivenessProbe, and there is no reason to block the whole pool.
+//
+// A DC outside the warmed set is not a miss: it returns ok=false without a
+// metric (see dcPool).
 func (p *dcPool) get(dcID int) (essentials.Conn, dc.Addr, bool) {
+	if _, ok := p.warm[dcID]; !ok {
+		return nil, dc.Addr{}, false
+	}
+
 	for {
 		wc, ok := p.pop(dcID)
 		if !ok {
@@ -192,17 +220,58 @@ func (p *dcPool) report(dcID int, result string) {
 	}
 }
 
-// fill is the filler goroutine of one DC: it tops the pool up to perDC and
-// evicts aged connections on every tick. A failed dial is not retried in a
-// loop (one attempt per tick) to avoid a handshake storm against a sick DC.
+// errDCPoolFallback is a warm dial that landed on another DC.
+var errDCPoolFallback = errors.New("warm dial landed on another DC (fallback)")
+
+// fill is the filler goroutine of one DC: it evicts aged connections on every
+// tick and tops the pool up to perDC. A failed dial is not retried in a loop:
+// the next attempt waits for an exponential backoff (see backoff), so a sick
+// DC or a broken upstream is not hammered every tick. That also matters for
+// SOCKS5 upstreams: their dial failures count towards the circuit breaker in
+// network/proxy_dialer.go, and an open breaker fails real client dials too.
+//
+// Only the first failure of a streak is logged at Info, the rest at Debug,
+// and the recovery is logged at Info again.
 func (p *dcPool) fill(ctx context.Context, dcID int) {
 	defer p.wg.Done()
 
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 
+	logger := p.logger.BindInt("dc", dcID)
+	failures := 0
+
+	var nextDial time.Time
+
 	for {
-		p.topUp(ctx, dcID)
+		if time.Now().Before(nextDial) {
+			p.evict(dcID)
+		} else {
+			err := p.topUp(ctx, dcID)
+
+			switch {
+			case err == nil:
+				if failures > 0 {
+					logger.Info("dc pool warm dial recovered")
+				}
+
+				failures = 0
+				nextDial = time.Time{}
+			case ctx.Err() != nil:
+				return
+			default:
+				failures++
+				pause := p.backoff(failures)
+				nextDial = time.Now().Add(pause)
+
+				msg := "dc pool warm dial failed, next attempt in " + pause.String()
+				if failures == 1 {
+					logger.InfoError(msg, err)
+				} else {
+					logger.DebugError(msg, err)
+				}
+			}
+		}
 
 		select {
 		case <-ctx.Done():
@@ -212,8 +281,20 @@ func (p *dcPool) fill(ctx context.Context, dcID int) {
 	}
 }
 
-// topUp evicts aged connections to dcID and refills the pool up to perDC.
-func (p *dcPool) topUp(ctx context.Context, dcID int) {
+// backoff is the pause after the n-th failed warm dial in a row: 2, 4, 8...
+// refresh intervals, capped at maxBackoff.
+func (p *dcPool) backoff(failures int) time.Duration {
+	pause := p.interval
+
+	for i := 0; i < failures && pause < p.maxBackoff; i++ {
+		pause *= 2
+	}
+
+	return min(pause, p.maxBackoff)
+}
+
+// evict closes connections to dcID that are older than maxAge.
+func (p *dcPool) evict(dcID int) int {
 	p.mu.Lock()
 
 	var live []warmConn
@@ -237,41 +318,77 @@ func (p *dcPool) topUp(ctx context.Context, dcID int) {
 
 	p.mu.Unlock()
 
-	for i := 0; i < expired; i++ {
+	for range expired {
 		p.report(dcID, DCPoolResultExpired)
 	}
 
-	for i := 0; i < need; i++ {
-		if ctx.Err() != nil {
-			return
+	return need
+}
+
+// topUp evicts aged connections to dcID and refills the pool up to perDC. It
+// stops on the first failed dial and returns its error.
+func (p *dcPool) topUp(ctx context.Context, dcID int) error {
+	need := p.evict(dcID)
+
+	for range need {
+		if err := ctx.Err(); err != nil {
+			return err //nolint: wrapcheck
 		}
 
-		conn, addr, actualDC, err := p.dial(ctx, dcID)
-		if err != nil {
-			// DC addresses are not loaded yet or the route is down: try again on
-			// the next tick. Clients are not blocked, they fall back to a cold dial.
-			p.logger.InfoError("dc pool warm dial failed", err)
+		if err := p.dialOne(ctx, dcID); err != nil {
 			p.report(dcID, DCPoolResultDialFail)
 
-			return
+			return err
 		}
-
-		// With AllowFallbackOnUnknownDC the dial may land on another DC. This
-		// does not happen for the warmed DCs 1..5 (their addresses are known),
-		// but if it does, the connection is handshaked to the wrong DC and must
-		// not be pooled under dcID.
-		if actualDC != dcID {
-			conn.Close() //nolint: errcheck
-
-			return
-		}
-
-		p.mu.Lock()
-		p.ready[dcID] = append(p.ready[dcID], warmConn{conn: conn, addr: addr, created: time.Now()})
-		p.mu.Unlock()
 
 		p.report(dcID, DCPoolResultDialOK)
 	}
+
+	return nil
+}
+
+// dialOne dials one warm connection to dcID and puts it into the pool. The
+// dial has its own deadline (dialTimeout), so a hung dial cannot hold the
+// filler, and Shutdown waiting for it, for longer than that.
+func (p *dcPool) dialOne(ctx context.Context, dcID int) error {
+	dialCtx := ctx
+
+	if p.dialTimeout > 0 {
+		var cancel context.CancelFunc
+
+		dialCtx, cancel = context.WithTimeout(ctx, p.dialTimeout)
+		defer cancel()
+	}
+
+	conn, addr, actualDC, err := p.dial(dialCtx, dcID)
+	if err != nil {
+		// DC addresses are not loaded yet or the route is down: the filler
+		// backs off. Clients are not blocked, they fall back to a cold dial.
+		return err
+	}
+
+	// With AllowFallbackOnUnknownDC a DC without a known address is dialed as
+	// the default DC. The connection is handshaked to the wrong DC and must
+	// not be pooled under dcID.
+	if actualDC != dcID {
+		conn.Close() //nolint: errcheck
+
+		return fmt.Errorf("%w: asked for DC %d, got DC %d", errDCPoolFallback, dcID, actualDC)
+	}
+
+	// Shutdown started while the dial was in flight: do not leave a
+	// connection in a pool that is being drained.
+	if err := ctx.Err(); err != nil {
+		conn.Close() //nolint: errcheck
+
+		return err //nolint: wrapcheck
+	}
+
+	p.mu.Lock()
+	p.ready[dcID] = append(p.ready[dcID], warmConn{conn: conn, addr: addr, created: time.Now()})
+	p.mu.Unlock()
+
+	return nil
 }
 
 // Shutdown stops the filler goroutines and closes all warm connections.

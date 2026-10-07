@@ -111,6 +111,7 @@ type Config struct {
 		Optional
 
 		Size TypeConcurrency `json:"size"`
+		DCs  []int           `json:"dcs"`
 	} `json:"dcPool"`
 	Stats struct {
 		StatsD struct {
@@ -200,6 +201,10 @@ func (c *Config) Validate() error {
 
 	if err := c.validateSecretLimits(); err != nil {
 		return err
+	}
+
+	if err := mtglib.ValidateDCPool(c.DCPool.Size.Get(0), c.DCPool.DCs); err != nil {
+		return fmt.Errorf("incorrect dc-pool section: %w", err)
 	}
 
 	return nil

@@ -967,11 +967,22 @@ func (p *Proxy) dialAndHandshake(ctx context.Context, dcID int) (essentials.Conn
 		return nil, dc.Addr{}, 0, fmt.Errorf("no available addresses for DC %d", dcID)
 	}
 
+	// The dial respects ctx, the handshake write does not: bound it by the ctx
+	// deadline, if any (the dcPool fillers set one).
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		conn.SetWriteDeadline(deadline) //nolint: errcheck
+	}
+
 	tgConn, err := foundAddr.Obfuscator.SendHandshake(conn, dcID)
 	if err != nil {
 		conn.Close() // nolint: errcheck
 
 		return nil, dc.Addr{}, 0, fmt.Errorf("cannot perform server handshake: %w", err)
+	}
+
+	if hasDeadline {
+		conn.SetWriteDeadline(time.Time{}) //nolint: errcheck
 	}
 
 	return tgConn, foundAddr, dcID, nil
@@ -1187,7 +1198,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			func(dcID int, result string) {
 				proxy.eventStream.Send(proxy.ctx, NewEventDCPool(dcID, result))
 			},
-			dcPoolWarmDCs,
+			opts.getDCPoolDCs(),
 			opts.getDCPoolSize(),
 			DCPoolConnMaxAge,
 			DCPoolRefreshInterval,

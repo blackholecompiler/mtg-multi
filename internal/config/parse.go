@@ -97,8 +97,9 @@ type tomlConfig struct {
 		FrameTimeout string `toml:"frame-timeout" json:"frameTimeout,omitempty"`
 	} `toml:"secured" json:"secured,omitempty"`
 	DCPool struct {
-		Enabled bool `toml:"enabled" json:"enabled,omitempty"`
-		Size    uint `toml:"size" json:"size,omitempty"`
+		Enabled bool  `toml:"enabled" json:"enabled,omitempty"`
+		Size    uint  `toml:"size" json:"size,omitempty"`
+		DCs     []int `toml:"dcs" json:"dcs,omitempty"`
 	} `toml:"dc-pool" json:"dcPool,omitempty"`
 	Stats struct {
 		StatsD struct {

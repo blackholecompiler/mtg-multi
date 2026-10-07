@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/mtg-multi/internal/config"
+	"github.com/mhsanaei/mtg-multi/mtglib"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -244,6 +245,25 @@ func (suite *ConfigTestSuite) TestDCPool() {
 	suite.NoError(conf.Validate())
 	suite.True(conf.DCPool.Enabled.Get(false))
 	suite.EqualValues(4, conf.DCPool.Size.Get(0))
+	suite.Equal([]int{1, 2, 3, 4, 5, -2, -4, 203}, conf.DCPool.DCs)
+}
+
+func (suite *ConfigTestSuite) TestDCPoolDefaultDCs() {
+	conf, err := config.Parse(suite.ReadConfig("minimal.toml"))
+	suite.NoError(err)
+	suite.Empty(conf.DCPool.DCs)
+}
+
+func (suite *ConfigTestSuite) TestDCPoolInvalid() {
+	for _, name := range []string{
+		"dc_pool_size_too_big.toml",
+		"dc_pool_bad_dcs.toml",
+		"dc_pool_dup_dcs.toml",
+	} {
+		conf, err := config.Parse(suite.ReadConfig(name))
+		suite.NoError(err, name)
+		suite.ErrorIs(conf.Validate(), mtglib.ErrDCPoolInvalid, name)
+	}
 }
 
 func TestConfig(t *testing.T) {

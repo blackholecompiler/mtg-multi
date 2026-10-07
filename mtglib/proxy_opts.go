@@ -1,6 +1,8 @@
 package mtglib
 
 import (
+	"fmt"
+	"math"
 	"net"
 	"time"
 )
@@ -368,10 +370,18 @@ type ProxyOpts struct {
 	DCPoolEnabled bool
 
 	// DCPoolSize is the number of warm connections kept per DC. Defaults to
-	// DefaultDCPoolSize.
+	// DefaultDCPoolSize, must not exceed DCPoolMaxSize.
 	//
 	// This is an optional setting.
 	DCPoolSize uint
+
+	// DCPoolDCs is the set of DCs the warm pool keeps connections to, as signed
+	// DC ids the way clients send them: negative ids are media DCs, 203 is the
+	// CDN DC. Client connections to any other DC always dial cold and are not
+	// reported in the dc_pool metric. Defaults to DefaultDCPoolDCs.
+	//
+	// This is an optional setting.
+	DCPoolDCs []int
 }
 
 func (p ProxyOpts) valid() error {
@@ -401,6 +411,40 @@ func (p ProxyOpts) valid() error {
 		}
 	}
 
+	if err := ValidateDCPool(p.DCPoolSize, p.DCPoolDCs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ValidateDCPool checks the warm pool settings: size must not exceed
+// DCPoolMaxSize, dcs must hold at most DCPoolMaxDCs distinct non-zero int16 DC
+// ids. They are validated even when the pool is disabled, so a broken config
+// does not surface only once it is enabled.
+func ValidateDCPool(size uint, dcs []int) error {
+	if size > DCPoolMaxSize {
+		return fmt.Errorf("%w: size %d is over the limit of %d", ErrDCPoolInvalid, size, DCPoolMaxSize)
+	}
+
+	if len(dcs) > DCPoolMaxDCs {
+		return fmt.Errorf("%w: %d DCs is over the limit of %d", ErrDCPoolInvalid, len(dcs), DCPoolMaxDCs)
+	}
+
+	seen := make(map[int]struct{}, len(dcs))
+
+	for _, dcID := range dcs {
+		if dcID == 0 || dcID < math.MinInt16 || dcID > math.MaxInt16 {
+			return fmt.Errorf("%w: DC %d is not a valid DC id", ErrDCPoolInvalid, dcID)
+		}
+
+		if _, ok := seen[dcID]; ok {
+			return fmt.Errorf("%w: duplicate DC %d", ErrDCPoolInvalid, dcID)
+		}
+
+		seen[dcID] = struct{}{}
+	}
+
 	return nil
 }
 
@@ -424,6 +468,14 @@ func (p ProxyOpts) getDCPoolSize() int {
 	}
 
 	return int(p.DCPoolSize)
+}
+
+func (p ProxyOpts) getDCPoolDCs() []int {
+	if len(p.DCPoolDCs) == 0 {
+		return append([]int(nil), DefaultDCPoolDCs...)
+	}
+
+	return append([]int(nil), p.DCPoolDCs...)
 }
 
 func (p ProxyOpts) getConcurrency() int {
