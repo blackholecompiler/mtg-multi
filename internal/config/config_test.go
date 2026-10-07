@@ -231,6 +231,21 @@ func (suite *ConfigTestSuite) TestSecured() {
 	suite.Equal(1500*time.Millisecond, conf.Secured.FrameTimeout.Get(0))
 }
 
+func (suite *ConfigTestSuite) TestDCPoolDisabledByDefault() {
+	conf, err := config.Parse(suite.ReadConfig("minimal.toml"))
+	suite.NoError(err)
+	suite.False(conf.DCPool.Enabled.Get(false))
+	suite.EqualValues(0, conf.DCPool.Size.Get(0))
+}
+
+func (suite *ConfigTestSuite) TestDCPool() {
+	conf, err := config.Parse(suite.ReadConfig("dc_pool.toml"))
+	suite.NoError(err)
+	suite.NoError(conf.Validate())
+	suite.True(conf.DCPool.Enabled.Get(false))
+	suite.EqualValues(4, conf.DCPool.Size.Get(0))
+}
+
 func TestConfig(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, &ConfigTestSuite{})

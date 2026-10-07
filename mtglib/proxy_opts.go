@@ -357,6 +357,21 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting, DefaultSecuredFrameTimeout by default.
 	SecuredFrameTimeout time.Duration
+
+	// DCPoolEnabled turns on the warm DC connection pool: a few pre-established
+	// connections to each Telegram DC, so a client connection does not pay for
+	// a cold dial and handshake and does not hit the Telegram client backoff
+	// when the node-to-DC route flaps. Note that the pool keeps connections to
+	// Telegram open even when there are no clients.
+	//
+	// This is an optional setting, disabled by default.
+	DCPoolEnabled bool
+
+	// DCPoolSize is the number of warm connections kept per DC. Defaults to
+	// DefaultDCPoolSize.
+	//
+	// This is an optional setting.
+	DCPoolSize uint
 }
 
 func (p ProxyOpts) valid() error {
@@ -401,6 +416,14 @@ func (p ProxyOpts) getSecrets() map[string]Secret {
 	}
 
 	return nil
+}
+
+func (p ProxyOpts) getDCPoolSize() int {
+	if p.DCPoolSize == 0 {
+		return DefaultDCPoolSize
+	}
+
+	return int(p.DCPoolSize)
 }
 
 func (p ProxyOpts) getConcurrency() int {

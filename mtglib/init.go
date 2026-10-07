@@ -138,7 +138,24 @@ const (
 
 	// DoppelGangerEach defines a time period between each crawl attempt.
 	DoppelGangerEach = 6 * time.Hour
+
+	// DefaultDCPoolSize is a default number of warm connections kept per DC in
+	// the dcPool.
+	DefaultDCPoolSize = 2
+
+	// DCPoolConnMaxAge is how long a warm DC connection may sit in the pool
+	// before it is evicted and replaced. Kept well under Telegram's idle-close
+	// threshold so a handed-over connection is not stale.
+	DCPoolConnMaxAge = 20 * time.Second
+
+	// DCPoolRefreshInterval is how often each filler goroutine tops up its DC
+	// (and evicts aged connections). Must be < DCPoolConnMaxAge so aged
+	// connections are replaced proactively.
+	DCPoolRefreshInterval = 7 * time.Second
 )
+
+// dcPoolWarmDCs is the list of Telegram DCs the warm pool keeps connections to.
+var dcPoolWarmDCs = []int{1, 2, 3, 4, 5}
 
 // Network defines a knowledge how to work with a network. It may sound fun but
 // it encapsulates all the knowledge how to properly establish connections to
