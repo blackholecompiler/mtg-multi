@@ -724,6 +724,62 @@ func TestDoTelegramCallPoolHit(t *testing.T) {
 	equalResults(t, rec.all(), []string{DCPoolResultHit})
 }
 
+// A secured (dd) client goes through the same doTelegramCall and gets a warm
+// connection for the DC from its obfuscated2 handshake.
+func TestDoTelegramCallPoolHitSecured(t *testing.T) {
+	proxy, network, _ := newDCPoolTestProxy(t, false)
+
+	secret := GenerateSecret("example.com")
+	proxy.ctx = context.Background()
+	proxy.antiReplayCache = &mapAntiReplayCache{seen: map[string]bool{}}
+	proxy.securedFrameTimeout = time.Second
+
+	pool := newTestPool(nil, 1, 20*time.Second)
+	rec := &recorder{}
+	pool.observe = rec.observe
+	pool.alive = nil
+
+	warm := &fakePoolConn{}
+	pool.ready[2] = []warmConn{{conn: warm, addr: testAddr(), created: time.Now()}}
+	proxy.dcPool = pool
+
+	frame := &recordingConn{}
+	if _, err := (obfuscation.Obfuscator{Secret: secret.Key[:]}).SendHandshake(frame, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	stream := newStreamContext(context.Background(), NoopLogger{}, securedTestConn(t, frame.buf.Bytes()))
+	defer stream.ctxCancel()
+
+	set := buildSecretSet(map[string]Secret{"main": secret}, nil, nil, nil)
+	if err := proxy.doSecuredHandshake(stream, newConnRewind(stream.clientConn), set); err != nil {
+		t.Fatalf("secured handshake: %v", err)
+	}
+
+	if !stream.secured || stream.dc != 2 {
+		t.Fatalf("unexpected stream state: secured=%v dc=%d", stream.secured, stream.dc)
+	}
+
+	if err := proxy.doTelegramCall(stream); err != nil {
+		t.Fatal(err)
+	}
+
+	got := stream.telegramConn
+	if traffic, ok := got.(connTraffic); ok {
+		got = traffic.Conn
+	}
+
+	if got != warm {
+		t.Fatalf("the dd stream must get the warm connection, got %#v", stream.telegramConn)
+	}
+
+	if n := network.dials.Load(); n != 0 {
+		t.Fatalf("a pool hit must not dial, dialed %d times", n)
+	}
+
+	equalResults(t, rec.all(), []string{DCPoolResultHit})
+}
+
 // doTelegramCall falls back to a cold dial on a pool miss.
 func TestDoTelegramCallPoolMiss(t *testing.T) {
 	proxy, network, dcs := newDCPoolTestProxy(t, false)
