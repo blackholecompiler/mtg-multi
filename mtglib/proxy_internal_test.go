@@ -2,6 +2,7 @@ package mtglib
 
 import (
 	"bytes"
+	"errors"
 	"context"
 	"io"
 	"net"
@@ -189,5 +190,74 @@ func TestDoSecuredHandshakeReplay(t *testing.T) {
 
 	if !bytes.Equal(replayed, frame) {
 		t.Fatal("the fronting replay must carry the original handshake bytes")
+	}
+}
+
+// A secured (dd) client whose secret matches but whose per-user limits deny
+// it (disabled here) is rejected like a wrong secret: the stream is not
+// marked secured, and its handshake bytes stay available for fronting. A dd
+// client that is allowed gets the per-secret ad-tag, as a FakeTLS one does.
+func TestDoSecuredHandshakeAppliesLimitsAndAdTag(t *testing.T) {
+	t.Parallel()
+
+	denied := GenerateSecret("example.com")
+	allowed := GenerateSecret("example.com")
+	tag := [AdTagLength]byte{1, 2, 3}
+
+	set := buildSecretSet(
+		map[string]Secret{"denied": denied, "allowed": allowed},
+		map[string][AdTagLength]byte{"allowed": tag},
+		nil,
+		map[string]SecretLimits{"denied": {Disabled: true}},
+	)
+
+	proxy := &Proxy{
+		ctx:                 context.Background(),
+		antiReplayCache:     &mapAntiReplayCache{seen: map[string]bool{}},
+		eventStream:         &countingEventStream{},
+		logger:              NoopLogger{},
+		securedFrameTimeout: time.Second,
+	}
+	proxy.secrets.Store(set)
+
+	frameFor := func(secret Secret) []byte {
+		rec := &recordingConn{}
+		if _, err := (obfuscation.Obfuscator{Secret: secret.Key[:]}).SendHandshake(rec, 2); err != nil {
+			t.Fatal(err)
+		}
+
+		return rec.buf.Bytes()
+	}
+
+	frame := frameFor(denied)
+	ctx := newStreamContext(context.Background(), NoopLogger{}, securedTestConn(t, frame))
+	rewind := newConnRewind(ctx.clientConn)
+
+	if err := proxy.doSecuredHandshake(ctx, rewind, set); !errors.Is(err, errSecuredDenied) {
+		t.Fatalf("a disabled user must be denied, got %v", err)
+	}
+
+	if ctx.secured || ctx.secretName != "" {
+		t.Fatalf("a denied stream must stay unauthenticated: secured=%v secret=%q", ctx.secured, ctx.secretName)
+	}
+
+	rewind.FinalRewind()
+
+	replayed := make([]byte, len(frame))
+	if _, err := io.ReadFull(rewind, replayed); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(replayed, frame) {
+		t.Fatal("the fronting replay must carry the original handshake bytes")
+	}
+
+	ctx = newStreamContext(context.Background(), NoopLogger{}, securedTestConn(t, frameFor(allowed)))
+	if err := proxy.doSecuredHandshake(ctx, newConnRewind(ctx.clientConn), set); err != nil {
+		t.Fatalf("an allowed user must pass: %v", err)
+	}
+
+	if !ctx.secured || ctx.secretName != "allowed" || ctx.adTag == nil || *ctx.adTag != tag {
+		t.Fatalf("unexpected stream state: secured=%v secret=%q adTag=%v", ctx.secured, ctx.secretName, ctx.adTag)
 	}
 }
