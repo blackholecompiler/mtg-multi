@@ -192,6 +192,20 @@ hot-applied. Changing the
 bind address, domain fronting, network, or throttle settings still needs a
 restart.
 
+The same reload is triggered by `SIGHUP`, which works without `api-bind-to`
+(not available on Windows; `simple-run` logs and ignores the signal):
+
+```console
+kill -HUP $(pidof mtg-multi)
+# or with systemd: ExecReload=/bin/kill -HUP $MAINPID, then
+systemctl reload mtg-multi
+```
+
+If the file cannot be read or is invalid, the current secrets are kept and a
+warning is logged. A new secret hostname that does not resolve is applied
+anyway, with a warning. Write the new config atomically (to a temporary file,
+then `mv`), so a reload never reads a half-written file.
+
 Responses: `200 {"status":"ok"}` on success; `500` if the config cannot be read
 (the current set stays active); `503` when the proxy was started without a config
 file (`simple-run`); `405` for a non-POST request.

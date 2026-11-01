@@ -42,6 +42,7 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 #   DELETE /adtag            clear the global ad-tag
 # Note: direct API mutations are in-memory only; a later POST /reload (or a
 # restart) re-reads this file and overrides them.
+# SIGHUP triggers the same reload as POST /reload, with or without the API.
 # api-bind-to = "127.0.0.1:9090"
 
 # Optional bearer token guarding EVERY API endpoint above. When set, requests

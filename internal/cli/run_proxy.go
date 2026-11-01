@@ -296,7 +296,7 @@ func makeSecretsReloader(configPath string) func() (mtglib.SecretConfig, error) 
 	}
 }
 
-func runProxy(conf *config.Config, version, configPath string) error { //nolint: funlen, cyclop
+func runProxy(conf *config.Config, version, configPath string, reloadSignals <-chan os.Signal) error { //nolint: funlen, cyclop
 	logger := makeLogger(conf)
 
 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
@@ -432,6 +432,10 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 
 	ctx, cancel := context.WithCancel(utils.RootContext())
 	defer cancel()
+
+	// SIGHUP re-reads the configuration and applies its secrets without a
+	// restart, exactly like POST /reload. Other options are not reloaded.
+	go watchReload(ctx, reloadSignals, proxy, net.DefaultResolver, logger.Named("reload"))
 
 	// If the accept loop stops for any reason other than shutdown, the process
 	// must not stay alive without accepting connections: stop and report the

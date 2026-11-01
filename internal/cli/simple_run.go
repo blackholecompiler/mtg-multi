@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/mtg-multi/internal/config"
+	"github.com/mhsanaei/mtg-multi/internal/utils"
 )
 
 type SimpleRun struct {
@@ -29,6 +30,11 @@ type SimpleRun struct {
 }
 
 func (s *SimpleRun) Run(cli *CLI, version string) error { //nolint: cyclop,funlen
+	// Catch SIGHUP first, as Run does: by default Go terminates on it, and
+	// systemd treats that exit as clean. simple-run has no config file to
+	// re-read, so the signal is only logged and ignored.
+	reloadSignals := utils.ReloadSignals()
+
 	conf := &config.Config{}
 
 	var bindHP config.TypeHostPort
@@ -109,5 +115,5 @@ func (s *SimpleRun) Run(cli *CLI, version string) error { //nolint: cyclop,funle
 		return fmt.Errorf("invalid result configuration: %w", err)
 	}
 
-	return runProxy(conf, version, "")
+	return runProxy(conf, version, "", reloadSignals)
 }
