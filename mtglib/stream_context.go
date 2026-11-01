@@ -11,19 +11,19 @@ import (
 )
 
 type streamContext struct {
-	ctx              context.Context
-	ctxCancel        context.CancelFunc
-	clientConn       essentials.Conn
-	telegramConn     essentials.Conn
-	streamID         string
-	dc               int
+	ctx          context.Context
+	ctxCancel    context.CancelFunc
+	clientConn   essentials.Conn
+	telegramConn essentials.Conn
+	streamID     string
+	dc           int
 	// matchedSecret is the secret the handshake authenticated with, taken
 	// from the snapshot the handshake read. registerConn compares it with the
 	// current snapshot, so a session that matched a secret removed or changed
 	// by a concurrent reload is rejected.
 	matchedSecret Secret
-	secretName       string
-	adTag            *[AdTagLength]byte
+	secretName    string
+	adTag         *[AdTagLength]byte
 	// secured is true for a secured ("dd") client: plain obfuscated2 without
 	// FakeTLS. Its obfuscated2 handshake is done in doSecuredHandshake, so
 	// ServeConn skips the FakeTLS-specific steps.

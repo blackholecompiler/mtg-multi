@@ -2,8 +2,8 @@ package mtglib
 
 import (
 	"bytes"
-	"errors"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
