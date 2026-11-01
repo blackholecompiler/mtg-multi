@@ -60,10 +60,34 @@ func newReloadTestProxy(secrets map[string]Secret) *Proxy {
 	return p
 }
 
-func registerFakeStream(p *Proxy, secretName string) *streamContext {
+// newFakeStream builds a stream that has authenticated with the named secret
+// of the current snapshot, as a handshake would.
+func newFakeStream(p *Proxy, secretName string) *streamContext {
 	ctx, cancel := context.WithCancel(context.Background())
 	sc := &streamContext{ctx: ctx, ctxCancel: cancel, secretName: secretName}
-	p.registerConn(sc)
+
+	set := p.secrets.Load()
+	for i, name := range set.names {
+		if name == secretName {
+			sc.matchedSecret = set.secrets[i]
+		}
+	}
+
+	return sc
+}
+
+// registerFakeStream adds an already-live stream for the named secret to the
+// live set, bypassing the validity check of registerConn: tests use it to
+// model streams that were connected before limits or secrets changed.
+func registerFakeStream(p *Proxy, secretName string) *streamContext {
+	sc := newFakeStream(p, secretName)
+
+	p.liveMu.Lock()
+	if p.liveConns[secretName] == nil {
+		p.liveConns[secretName] = make(map[*streamContext]struct{})
+	}
+	p.liveConns[secretName][sc] = struct{}{}
+	p.liveMu.Unlock()
 
 	return sc
 }
@@ -107,6 +131,53 @@ func TestProxyReloadSecrets(t *testing.T) {
 
 		assert.Equal(t, rekeyed.Key, p.secrets.Load().secrets[0].Key)
 		assert.ErrorIs(t, stream.Err(), context.Canceled)
+	})
+
+	t.Run("secret moved to another host closes its old streams", func(t *testing.T) {
+		t.Parallel()
+
+		p := newReloadTestProxy(map[string]Secret{"alice": alice})
+		moved := alice
+		moved.Host = "new.example.com"
+		p.reloader = func() (SecretConfig, error) {
+			return SecretConfig{Secrets: map[string]Secret{"alice": moved}}, nil
+		}
+
+		stream := registerFakeStream(p, "alice")
+
+		require.NoError(t, p.ReloadSecrets())
+
+		assert.ErrorIs(t, stream.Err(), context.Canceled)
+	})
+
+	t.Run("a handshake that matched a secret changed meanwhile is not registered", func(t *testing.T) {
+		t.Parallel()
+
+		p := newReloadTestProxy(map[string]Secret{"alice": alice, "bob": bob})
+		rekeyed := GenerateSecret("alice.example.com")
+		p.reloader = func() (SecretConfig, error) {
+			return SecretConfig{
+				Secrets: map[string]Secret{"alice": rekeyed, "bob": bob},
+				Limits:  map[string]SecretLimits{"bob": {Disabled: true}},
+			}, nil
+		}
+
+		// Both handshakes finished against the old snapshot, but the reload
+		// (and its cleanup) ran before they registered.
+		aliceStream := newFakeStream(p, "alice")
+		bobStream := newFakeStream(p, "bob")
+
+		require.NoError(t, p.ReloadSecrets())
+
+		assert.False(t, p.registerConn(aliceStream), "a re-keyed secret must be rejected")
+		assert.False(t, p.registerConn(bobStream), "a disabled secret must be rejected")
+
+		p.liveMu.Lock()
+		assert.Empty(t, p.liveConns)
+		p.liveMu.Unlock()
+
+		// A handshake against the new snapshot registers as usual.
+		assert.True(t, p.registerConn(newFakeStream(p, "alice")))
 	})
 
 	t.Run("added secret is pre-registered and disturbs nothing", func(t *testing.T) {

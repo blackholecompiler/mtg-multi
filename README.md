@@ -184,7 +184,7 @@ On success it re-reads the same config file passed to `mtg-multi run` and swaps
 the secret set in atomically:
 
 - added secrets start working immediately;
-- connections whose secret was removed or re-keyed are closed;
+- connections whose secret was removed, re-keyed or moved to another host are closed;
 - every other user stays connected and their stats counters carry over.
 
 Only `[secrets]`, `ad-tag`, `[secret-ad-tags]`, and `[secret-limits]` are

@@ -17,7 +17,11 @@ type streamContext struct {
 	telegramConn     essentials.Conn
 	streamID         string
 	dc               int
-	matchedSecretKey []byte
+	// matchedSecret is the secret the handshake authenticated with, taken
+	// from the snapshot the handshake read. registerConn compares it with the
+	// current snapshot, so a session that matched a secret removed or changed
+	// by a concurrent reload is rejected.
+	matchedSecret Secret
 	secretName       string
 	adTag            *[AdTagLength]byte
 	// secured is true for a secured ("dd") client: plain obfuscated2 without

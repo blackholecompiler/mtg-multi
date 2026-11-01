@@ -294,7 +294,10 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 	defer p.stats.OnDisconnect(ctx.secretName)
 
-	p.registerConn(ctx)
+	if !p.registerConn(ctx) {
+		ctx.logger.Info("secret was removed, changed or denied by a concurrent reload")
+		return
+	}
 	defer p.unregisterConn(ctx)
 
 	// FakeTLS specifics: the doppelganger wrapper and a separate obfuscated2
@@ -455,9 +458,21 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	return nil
 }
 
-func (p *Proxy) registerConn(ctx *streamContext) {
+// registerConn adds the stream to the live set, unless its secret is no longer
+// valid in the current snapshot: removed, re-keyed, moved to another host, or
+// disabled/expired. The handshake matched against the snapshot it loaded, and
+// a reload may have swapped the set and run closeStaleConns/closeDeniedConns
+// since then; such a stream would never be closed. The check runs under liveMu
+// after the swap is visible: either the stream is registered before the
+// cleanup takes liveMu (and the cleanup closes it), or it sees the new set
+// here and is rejected.
+func (p *Proxy) registerConn(ctx *streamContext) bool {
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
+
+	if !p.sessionStillValid(ctx) {
+		return false
+	}
 
 	conns := p.liveConns[ctx.secretName]
 	if conns == nil {
@@ -466,6 +481,25 @@ func (p *Proxy) registerConn(ctx *streamContext) {
 	}
 
 	conns[ctx] = struct{}{}
+
+	return true
+}
+
+// sessionStillValid reports whether the stream's secret is unchanged in the
+// current snapshot and not denied by its limits. Quota is not checked, as in
+// closeDeniedConns: it was checked by the handshake and is enforced on the
+// traffic itself.
+func (p *Proxy) sessionStillValid(ctx *streamContext) bool {
+	set := p.secrets.Load()
+
+	idx := sort.SearchStrings(set.names, ctx.secretName)
+	if idx >= len(set.names) || set.names[idx] != ctx.secretName || set.secrets[idx] != ctx.matchedSecret {
+		return false
+	}
+
+	allowed, reason := p.checkLimits(ctx.secretName, set.limits[idx])
+
+	return allowed || reason == DenyQuota
 }
 
 func (p *Proxy) unregisterConn(ctx *streamContext) {
@@ -485,19 +519,20 @@ func (p *Proxy) unregisterConn(ctx *streamContext) {
 }
 
 // closeStaleConns closes every live stream whose secret was dropped from the
-// new set or whose key changed since the old set (a re-key), and leaves the
-// rest connected. Streams are snapshotted under the lock and closed outside it,
-// so each stream's own unregister (which also takes the lock) cannot deadlock.
+// new set or changed since the old set (a re-key or a new host), and leaves
+// the rest connected. Streams are snapshotted under the lock and closed outside
+// it, so each stream's own unregister (which also takes the lock) cannot
+// deadlock.
 func (p *Proxy) closeStaleConns(oldSet, newSet *secretSet) {
-	newKeys := make(map[string][SecretKeyLength]byte, len(newSet.names))
+	newSecrets := make(map[string]Secret, len(newSet.names))
 	for i, name := range newSet.names {
-		newKeys[name] = newSet.secrets[i].Key
+		newSecrets[name] = newSet.secrets[i]
 	}
 
-	oldKeys := make(map[string][SecretKeyLength]byte)
+	oldSecrets := make(map[string]Secret)
 	if oldSet != nil {
 		for i, name := range oldSet.names {
-			oldKeys[name] = oldSet.secrets[i].Key
+			oldSecrets[name] = oldSet.secrets[i]
 		}
 	}
 
@@ -505,8 +540,8 @@ func (p *Proxy) closeStaleConns(oldSet, newSet *secretSet) {
 
 	p.liveMu.Lock()
 	for name, conns := range p.liveConns {
-		if newKey, kept := newKeys[name]; kept {
-			if oldKey, had := oldKeys[name]; had && oldKey == newKey {
+		if newSecret, kept := newSecrets[name]; kept {
+			if oldSecret, had := oldSecrets[name]; had && oldSecret == newSecret {
 				continue
 			}
 		}
@@ -687,7 +722,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	}
 
 	matchedSecret := set.secrets[result.MatchedIndex]
-	ctx.matchedSecretKey = matchedSecret.Key[:]
+	ctx.matchedSecret = matchedSecret
 	ctx.secretName = set.names[result.MatchedIndex]
 	ctx.adTag = set.effectiveAdTag(result.MatchedIndex)
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
@@ -764,7 +799,7 @@ func (p *Proxy) doSecuredHandshake(ctx *streamContext, rewind *connRewind, set *
 	ctx.secured = true
 	ctx.dc = dcIdx
 	ctx.clientConn = cn
-	ctx.matchedSecretKey = set.secrets[idx].Key[:]
+	ctx.matchedSecret = set.secrets[idx]
 	ctx.secretName = name
 	ctx.adTag = set.effectiveAdTag(idx)
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName).BindInt("dc", dcIdx)
@@ -807,7 +842,7 @@ func (p *Proxy) readSecuredFrame(
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 	// Use the secret key that was matched during the FakeTLS handshake.
 	obfs := obfuscation.Obfuscator{
-		Secret: ctx.matchedSecretKey,
+		Secret: ctx.matchedSecret.Key[:],
 	}
 
 	dc, conn, err := obfs.ReadHandshake(ctx.clientConn)
