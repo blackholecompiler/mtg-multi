@@ -17,40 +17,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # This fork only needs the Docker image of its 3x-ui fork, which runs
+        # on linux/amd64. Add platforms back here to publish more archives.
         include:
           - platform: linux-amd64
             goos: linux
             goarch: amd64
-          - platform: linux-386
-            goos: linux
-            goarch: "386"
-          - platform: linux-arm64
-            goos: linux
-            goarch: arm64
-          - platform: linux-armv5
-            goos: linux
-            goarch: arm
-            goarm: "5"
-          - platform: linux-armv6
-            goos: linux
-            goarch: arm
-            goarm: "6"
-          - platform: linux-armv7
-            goos: linux
-            goarch: arm
-            goarm: "7"
-          - platform: linux-s390x
-            goos: linux
-            goarch: s390x
-          - platform: windows-amd64
-            goos: windows
-            goarch: amd64
-          - platform: windows-386
-            goos: windows
-            goarch: "386"
-          - platform: windows-arm64
-            goos: windows
-            goarch: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v7
